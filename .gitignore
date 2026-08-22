@@ -1,0 +1,10 @@
+.env
+session.json
+scraper.lock
+data/*.db
+logs/*.log
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
