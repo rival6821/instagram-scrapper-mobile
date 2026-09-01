@@ -96,7 +96,7 @@ REQUEST_TIMEOUT=15
 ## ⏰ 배포 및 스케줄러 설정 (Cron & Scheduling)
 
 ### 1. Crontab 설정
-평일(월~금) 10:00부터 11:50까지 10분 간격으로 총 12회 실행하며, 중복 실행 방지를 위해 `flock`을 적용합니다.
+평일(월~금) 10:00부터 11:50까지 10분 간격으로 총 12회 실행합니다. 중복 실행 방지는 `scraper.py` 내부에서 `scraper.lock`에 대한 `flock`(non-blocking)으로 처리하므로 crontab 쪽에서 별도로 `flock`을 감쌀 필요는 없습니다 — 이 락은 cron 실행과 텔레그램 `/run` 명령 실행이 동시에 겹치는 경우도 함께 막아줍니다 (겹치면 뒤에 시도한 쪽이 `FAIL_LOCKED` 상태로 즉시 종료됩니다).
 
 ```bash
 crontab -e
@@ -106,7 +106,7 @@ crontab -e
 
 ```cron
 # 평일 10:00 ~ 11:50 (10:00, 10:10 ... 11:50) 매 10분마다 실행
-*/10 10,11 * * 1-5 flock -n /data/data/com.termux/files/home/instagram-scraper/scraper.lock -c "cd /data/data/com.termux/files/home/instagram-scraper && git pull --rebase origin main >> logs/git.log 2>&1 && python scraper.py >> logs/cron.log 2>&1"
+*/10 10,11 * * 1-5 cd /data/data/com.termux/files/home/instagram-scraper && git pull --rebase origin main >> logs/git.log 2>&1 && python scraper.py >> logs/cron.log 2>&1
 ```
 
 ---

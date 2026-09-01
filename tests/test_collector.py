@@ -13,7 +13,9 @@ os.environ["TARGET_USERNAME"] = "test_user_1,test_user_2"
 os.environ["JITTER_MAX_SECONDS"] = "0"
 
 import db
+import scraper
 import session_manager
+import telegram_notifier
 from scraper import parse_post_node, fetch_user_posts, run_scraper
 from telegram_bot import admin_only, get_disk_info, get_battery_info
 
@@ -233,6 +235,52 @@ class TestCollectorSystem(unittest.TestCase):
     def test_disk_info(self):
         info = get_disk_info()
         self.assertIn("GB", info)
+
+    def test_scraper_lock_prevents_concurrent_acquire(self):
+        lock_path = self.test_dir / "test_scraper.lock"
+        with patch("scraper.LOCK_FILE_PATH", lock_path):
+            first = scraper._try_acquire_lock()
+            self.assertIsNotNone(first)
+
+            # A second attempt while the first is still held must fail.
+            second = scraper._try_acquire_lock()
+            self.assertIsNone(second)
+
+            scraper._release_lock(first)
+
+            # Once released, a new attempt should succeed again.
+            third = scraper._try_acquire_lock()
+            self.assertIsNotNone(third)
+            scraper._release_lock(third)
+
+    @patch("scraper.time.sleep", return_value=None)
+    @patch("requests.get")
+    def test_fetch_user_posts_unexpected_status_retries_then_fail_unknown(self, mock_get, mock_sleep):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        mock_resp.text = "Internal Server Error"
+        mock_get.return_value = mock_resp
+
+        status, posts, err = fetch_user_posts("user1", "dummy_session", max_retries=2)
+
+        self.assertEqual(status, "FAIL_UNKNOWN")
+        self.assertEqual(posts, [])
+        self.assertEqual(mock_get.call_count, 2)
+        self.assertTrue(mock_sleep.called)
+
+    @patch("telegram_notifier.send_telegram_message")
+    def test_notify_functions_escape_html(self, mock_send):
+        mock_send.return_value = True
+
+        telegram_notifier.notify_session_expired("<script>bad</script> & stuff")
+        sent_text = mock_send.call_args[0][0]
+        self.assertNotIn("<script>", sent_text)
+        self.assertIn("&lt;script&gt;", sent_text)
+
+        telegram_notifier.notify_new_posts("user<b>x", 1, "abc<>def")
+        sent_text = mock_send.call_args[0][0]
+        self.assertNotIn("<b>x", sent_text)
+        self.assertNotIn("abc<>def", sent_text)
 
 
 if __name__ == "__main__":

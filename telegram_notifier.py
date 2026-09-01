@@ -1,3 +1,4 @@
+import html
 import logging
 from typing import Optional
 import requests
@@ -43,7 +44,7 @@ def notify_session_expired(reason: str = "세션 쿠키가 만료되었거나 �
     """Send high-priority alert for session expiration."""
     msg = (
         "⚠️ <b>[Instagram Scraper] 세션 만료 감지</b>\n\n"
-        f"<b>원인:</b> {reason}\n"
+        f"<b>원인:</b> {html.escape(str(reason))}\n"
         "인스타그램 세션이 만료되어 스크래핑이 중단되었습니다.\n\n"
         "👉 텔레그램 봇으로 새 세션을 입력해주세요:\n"
         "<code>/session &lt;새로운_sessionid&gt;</code>"
@@ -55,7 +56,7 @@ def notify_rate_limit(details: str = "429 Too Many Requests") -> bool:
     """Send high-priority alert for rate limits."""
     msg = (
         "🚨 <b>[Instagram Scraper] Rate Limit (요청 제한) 감지</b>\n\n"
-        f"<b>상세:</b> {details}\n"
+        f"<b>상세:</b> {html.escape(str(details))}\n"
         "인스타그램 요청 제한(429)이 감지되어 이번 수집 작업을 중단했습니다.\n"
         "계정 보호를 위해 잠시 대기 후 다음 스케줄에 재시도합니다."
     )
@@ -66,9 +67,9 @@ def notify_new_posts(username: str, count: int, sample_post_id: Optional[str] = 
     """Send notification when new posts are collected."""
     msg = (
         f"📸 <b>[Instagram Scraper] 신규 포스트 수집</b>\n\n"
-        f"• 대상 계정: <b>@{username}</b>\n"
+        f"• 대상 계정: <b>@{html.escape(str(username))}</b>\n"
         f"• 수집 건수: <b>{count}건</b>\n"
     )
     if sample_post_id:
-        msg += f"• 최신 링크: https://www.instagram.com/p/{sample_post_id}/\n"
+        msg += f"• 최신 링크: https://www.instagram.com/p/{html.escape(str(sample_post_id))}/\n"
     return send_telegram_message(msg)

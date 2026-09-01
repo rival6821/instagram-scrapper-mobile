@@ -5,6 +5,7 @@ Runs continuously in the background (Long-polling) to handle admin commands and 
 """
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -153,15 +154,15 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     session_data = load_session()
     has_session = bool(session_data.get("sessionid"))
-    session_updated_at = session_data.get("updated_at", "알 수 없음")
+    session_updated_at = html.escape(str(session_data.get("updated_at", "알 수 없음")))
     session_status = f"✅ 등록됨 (갱신: {session_updated_at})" if has_session else "❌ 미등록 또는 만료"
 
-    targets_str = ", ".join([f"@{u}" for u in TARGET_USERNAMES]) if TARGET_USERNAMES else "없음"
+    targets_str = html.escape(", ".join([f"@{u}" for u in TARGET_USERNAMES])) if TARGET_USERNAMES else "없음"
 
     msg = (
         "📊 <b>[시스템 상태 리포트]</b>\n\n"
-        f"🔋 <b>배터리:</b> {battery_info}\n"
-        f"💾 <b>저장공간:</b> {disk_info}\n"
+        f"🔋 <b>배터리:</b> {html.escape(battery_info)}\n"
+        f"💾 <b>저장공간:</b> {html.escape(disk_info)}\n"
         f"🔑 <b>세션 상태:</b> {session_status}\n"
         f"🎯 <b>수집 대상:</b> {targets_str}\n"
         f"📦 <b>누적 저장 포스트:</b> {total_posts:,}건\n"
@@ -234,15 +235,15 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             msg = (
                 f"⚠️ <b>수집 작업 완료 (주의/실패)</b>\n\n"
-                f"• 상태: <b>{status}</b>\n"
-                f"• 에러 메시지: <code>{err or 'None'}</code>\n"
+                f"• 상태: <b>{html.escape(str(status))}</b>\n"
+                f"• 에러 메시지: <code>{html.escape(str(err)) if err else 'None'}</code>\n"
                 f"• 신규 수집 포스트: <b>{new_count}건</b>"
             )
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
     except Exception as e:
         logger.error(f"Error during manual /run execution: {e}", exc_info=True)
         await update.message.reply_text(
-            f"❌ <b>실행 중 예외가 발생했습니다:</b>\n<code>{e}</code>",
+            f"❌ <b>실행 중 예외가 발생했습니다:</b>\n<code>{html.escape(str(e))}</code>",
             parse_mode=ParseMode.HTML
         )
 
@@ -275,9 +276,9 @@ async def cmd_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_summary = []
     for r in reversed(db_logs):
         status_icon = "✅" if r["status"] == "SUCCESS" else "❌"
-        err = f" ({r['error_message']})" if r.get("error_message") else ""
+        err = f" ({html.escape(str(r['error_message']))})" if r.get("error_message") else ""
         db_summary.append(
-            f"{status_icon} [{r['executed_at']}] {r['status']} | 신규 {r['new_posts_count']}건{err}"
+            f"{status_icon} [{r['executed_at']}] {html.escape(str(r['status']))} | 신규 {r['new_posts_count']}건{err}"
         )
     db_text = "\n".join(db_summary) if db_summary else "기록 없음"
 
@@ -292,7 +293,7 @@ async def cmd_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_tail_text = "..." + file_tail_text[-2000:]
         msg += (
             f"📄 <b>[최근 cron.log 내용]</b> (최근 {lines_count}줄)\n"
-            f"<pre>{file_tail_text}</pre>"
+            f"<pre>{html.escape(file_tail_text)}</pre>"
         )
 
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
