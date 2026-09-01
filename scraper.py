@@ -6,6 +6,7 @@ Executed via Crond on schedule or manually via /run in Telegram bot.
 
 import argparse
 import datetime
+import fcntl
 import json
 import logging
 import random
@@ -18,6 +19,7 @@ import requests
 from config import (
     CRON_LOG_PATH,
     JITTER_MAX_SECONDS,
+    LOCK_FILE_PATH,
     LOG_DIR,
     REQUEST_TIMEOUT,
     TARGET_USERNAMES,
@@ -207,7 +209,15 @@ def fetch_user_posts(
                 logger.info(f"Successfully fetched {len(parsed_posts)} posts for @{username}.")
                 return "SUCCESS", parsed_posts, None
 
+            # Unexpected status code (e.g. 403, 500): back off and retry like a network error
+            # instead of hammering Instagram immediately, and don't mislabel this as FAIL_NETWORK.
             logger.warning(f"Unexpected status code {response.status_code}: {response.text[:200]}")
+            if attempt < max_retries:
+                backoff = 2 ** attempt
+                logger.info(f"Retrying in {backoff} seconds...")
+                time.sleep(backoff)
+                continue
+            return "FAIL_UNKNOWN", [], f"Unexpected status code {response.status_code} after {max_retries} attempts"
 
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as net_err:
             logger.warning(f"Network error on attempt {attempt}: {net_err}")
@@ -221,7 +231,35 @@ def fetch_user_posts(
             logger.error(f"Unexpected error fetching posts: {e}", exc_info=True)
             return "FAIL_UNKNOWN", [], str(e)
 
-    return "FAIL_NETWORK", [], "Max retries exceeded"
+    return "FAIL_UNKNOWN", [], "Max retries exceeded"
+
+
+def _try_acquire_lock():
+    """
+    Attempt to acquire an exclusive, non-blocking flock on LOCK_FILE_PATH.
+
+    This is the single locking mechanism for the whole process: both the
+    cron-triggered run (scraper.py main()) and the Telegram-triggered /run
+    command call run_scraper() directly, so locking here is what actually
+    keeps two runs from executing concurrently and racing on session.json /
+    the SQLite DB. Returns the open file handle (must be kept referenced to
+    hold the lock, then released via _release_lock) on success, or None if
+    another run already holds it.
+    """
+    lock_file = open(LOCK_FILE_PATH, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock_file.close()
+        return None
+    return lock_file
+
+
+def _release_lock(lock_file) -> None:
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+    finally:
+        lock_file.close()
 
 
 def run_scraper(apply_jitter: bool = True) -> tuple[str, int, Optional[str]]:
@@ -231,79 +269,90 @@ def run_scraper(apply_jitter: bool = True) -> tuple[str, int, Optional[str]]:
     """
     logger.info("=" * 50)
     logger.info(f"Starting Instagram Scraper run at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
+
     # 0. Initialize DB
     init_db()
 
-    # 1. Validate Basic Config
-    config_errors = validate_config(require_telegram=False, require_target=True)
-    if config_errors:
-        err_msg = "; ".join(config_errors)
-        logger.error(f"Configuration error: {err_msg}")
-        log_execution("FAIL_CONFIG", 0, err_msg)
-        return "FAIL_CONFIG", 0, err_msg
+    # 0.5 Acquire single-instance lock (see _try_acquire_lock docstring)
+    lock_file = _try_acquire_lock()
+    if lock_file is None:
+        err_msg = "다른 스크래핑 작업이 이미 실행 중입니다 (lock 획득 실패)."
+        logger.warning(err_msg)
+        log_execution("FAIL_LOCKED", 0, err_msg)
+        return "FAIL_LOCKED", 0, err_msg
 
-    # 2. Jitter delay for detection avoidance
-    if apply_jitter and JITTER_MAX_SECONDS > 0:
-        jitter_delay = random.randint(0, JITTER_MAX_SECONDS)
-        logger.info(f"Applying Jitter delay: sleeping for {jitter_delay}s...")
-        time.sleep(jitter_delay)
+    try:
+        # 1. Validate Basic Config
+        config_errors = validate_config(require_telegram=False, require_target=True)
+        if config_errors:
+            err_msg = "; ".join(config_errors)
+            logger.error(f"Configuration error: {err_msg}")
+            log_execution("FAIL_CONFIG", 0, err_msg)
+            return "FAIL_CONFIG", 0, err_msg
 
-    # 3. Validate Session
-    sessionid = get_sessionid()
-    if not sessionid or not validate_sessionid_format(sessionid):
-        err_msg = "session.json is missing, empty, or has an invalid sessionid format."
-        logger.error(err_msg)
-        notify_session_expired(err_msg)
-        log_execution("FAIL_SESSION", 0, err_msg)
-        return "FAIL_SESSION", 0, err_msg
+        # 2. Jitter delay for detection avoidance
+        if apply_jitter and JITTER_MAX_SECONDS > 0:
+            jitter_delay = random.randint(0, JITTER_MAX_SECONDS)
+            logger.info(f"Applying Jitter delay: sleeping for {jitter_delay}s...")
+            time.sleep(jitter_delay)
 
-    total_new_posts = 0
-    overall_status = "SUCCESS"
-    last_error = None
+        # 3. Validate Session
+        sessionid = get_sessionid()
+        if not sessionid or not validate_sessionid_format(sessionid):
+            err_msg = "session.json is missing, empty, or has an invalid sessionid format."
+            logger.error(err_msg)
+            notify_session_expired(err_msg)
+            log_execution("FAIL_SESSION", 0, err_msg)
+            return "FAIL_SESSION", 0, err_msg
 
-    # 4. Fetch posts for all target usernames
-    for username in TARGET_USERNAMES:
-        status, posts, err = fetch_user_posts(username, sessionid)
-        
-        if status == "FAIL_SESSION":
-            overall_status = "FAIL_SESSION"
-            last_error = err
-            notify_session_expired(f"@{username} 수집 중 세션 오류: {err}")
-            break
-        elif status == "FAIL_RATE_LIMIT":
-            overall_status = "FAIL_RATE_LIMIT"
-            last_error = err
-            notify_rate_limit(f"@{username} 수집 중 Rate Limit: {err}")
-            break
-        elif status != "SUCCESS":
-            overall_status = status
-            last_error = err
-            logger.error(f"Failed to fetch posts for @{username}: {err}")
-            continue
+        total_new_posts = 0
+        overall_status = "SUCCESS"
+        last_error = None
 
-        # Save to DB
-        new_count = 0
-        latest_post_id = None
-        for post in posts:
-            is_new = save_post(post)
-            if is_new:
-                new_count += 1
-                if not latest_post_id:
-                    latest_post_id = post["post_id"]
+        # 4. Fetch posts for all target usernames
+        for username in TARGET_USERNAMES:
+            status, posts, err = fetch_user_posts(username, sessionid)
 
-        logger.info(f"@{username}: {len(posts)} posts evaluated, {new_count} new posts saved.")
-        total_new_posts += new_count
+            if status == "FAIL_SESSION":
+                overall_status = "FAIL_SESSION"
+                last_error = err
+                notify_session_expired(f"@{username} 수집 중 세션 오류: {err}")
+                break
+            elif status == "FAIL_RATE_LIMIT":
+                overall_status = "FAIL_RATE_LIMIT"
+                last_error = err
+                notify_rate_limit(f"@{username} 수집 중 Rate Limit: {err}")
+                break
+            elif status != "SUCCESS":
+                overall_status = status
+                last_error = err
+                logger.error(f"Failed to fetch posts for @{username}: {err}")
+                continue
 
-        if new_count > 0:
-            notify_new_posts(username, new_count, latest_post_id)
+            # Save to DB
+            new_count = 0
+            latest_post_id = None
+            for post in posts:
+                is_new = save_post(post)
+                if is_new:
+                    new_count += 1
+                    if not latest_post_id:
+                        latest_post_id = post["post_id"]
 
-    # 5. Record execution log
-    log_execution(overall_status, total_new_posts, last_error)
-    logger.info(f"Scraper run finished with status={overall_status}, new_posts={total_new_posts}, error={last_error}")
-    logger.info("=" * 50)
-    
-    return overall_status, total_new_posts, last_error
+            logger.info(f"@{username}: {len(posts)} posts evaluated, {new_count} new posts saved.")
+            total_new_posts += new_count
+
+            if new_count > 0:
+                notify_new_posts(username, new_count, latest_post_id)
+
+        # 5. Record execution log
+        log_execution(overall_status, total_new_posts, last_error)
+        logger.info(f"Scraper run finished with status={overall_status}, new_posts={total_new_posts}, error={last_error}")
+        logger.info("=" * 50)
+
+        return overall_status, total_new_posts, last_error
+    finally:
+        _release_lock(lock_file)
 
 
 def main():
